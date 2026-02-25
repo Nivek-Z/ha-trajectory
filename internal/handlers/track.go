@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"ha-trajectory/internal/models"
 )
 
 type TrackHandler struct {
@@ -17,6 +19,8 @@ type TrackRepository interface {
 	CreatePoint(ctx context.Context, deviceID string, lat, lon float64, ts time.Time) error
 	GetPathGeoJSON(ctx context.Context, deviceID string, start, end time.Time) (*string, error)
 	GetPathGeoJSONAll(ctx context.Context, deviceID string) (*string, error)
+	GetPoints(ctx context.Context, deviceID string, start, end time.Time) ([]models.TrackPointView, error)
+	GetPointsAll(ctx context.Context, deviceID string) ([]models.TrackPointView, error)
 }
 
 // TrackRequest matches Home Assistant push format.
@@ -27,12 +31,15 @@ type TrackRequest struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-type pathResponse struct {
-	DeviceID string  `json:"device_id"`
-	Date     string  `json:"date,omitempty"`
-	Start    string  `json:"start,omitempty"`
-	End      string  `json:"end,omitempty"`
-	GeoJSON  *string `json:"geojson"`
+type featureCollection struct {
+	Type     string    `json:"type"`
+	Features []feature `json:"features"`
+}
+
+type feature struct {
+	Type       string                 `json:"type"`
+	Properties map[string]interface{} `json:"properties"`
+	Geometry   json.RawMessage        `json:"geometry"`
 }
 
 func NewTrackHandler(repo TrackRepository) *TrackHandler {
@@ -82,13 +89,14 @@ func (h *TrackHandler) HandlePath(w http.ResponseWriter, r *http.Request) {
 	var (
 		geojson *string
 		err     error
-		resp    pathResponse
+		points  []models.TrackPointView
 	)
-
-	resp.DeviceID = deviceID
 
 	if allStr == "1" || allStr == "true" {
 		geojson, err = h.repo.GetPathGeoJSONAll(r.Context(), deviceID)
+		if err == nil {
+			points, err = h.repo.GetPointsAll(r.Context(), deviceID)
+		}
 	} else if daysStr != "" {
 		days, convErr := parsePositiveInt(daysStr)
 		if convErr != nil {
@@ -97,9 +105,10 @@ func (h *TrackHandler) HandlePath(w http.ResponseWriter, r *http.Request) {
 		}
 		end := time.Now().UTC()
 		start := end.AddDate(0, 0, -days)
-		resp.Start = start.Format(time.RFC3339)
-		resp.End = end.Format(time.RFC3339)
 		geojson, err = h.repo.GetPathGeoJSON(r.Context(), deviceID, start, end)
+		if err == nil {
+			points, err = h.repo.GetPoints(r.Context(), deviceID, start, end)
+		}
 	} else if dateStr != "" {
 		date, parseErr := time.Parse("2006-01-02", dateStr)
 		if parseErr != nil {
@@ -108,14 +117,18 @@ func (h *TrackHandler) HandlePath(w http.ResponseWriter, r *http.Request) {
 		}
 		start := date.UTC()
 		end := start.AddDate(0, 0, 1)
-		resp.Date = dateStr
 		geojson, err = h.repo.GetPathGeoJSON(r.Context(), deviceID, start, end)
+		if err == nil {
+			points, err = h.repo.GetPoints(r.Context(), deviceID, start, end)
+		}
 	} else {
 		now := time.Now().UTC()
 		start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 		end := start.AddDate(0, 0, 1)
-		resp.Date = start.Format("2006-01-02")
 		geojson, err = h.repo.GetPathGeoJSON(r.Context(), deviceID, start, end)
+		if err == nil {
+			points, err = h.repo.GetPoints(r.Context(), deviceID, start, end)
+		}
 	}
 
 	if err != nil {
@@ -123,8 +136,13 @@ func (h *TrackHandler) HandlePath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp.GeoJSON = geojson
-	writeJSON(w, http.StatusOK, resp)
+	fc, buildErr := buildFeatureCollection(deviceID, geojson, points)
+	if buildErr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "build geojson failed"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, fc)
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
@@ -139,4 +157,52 @@ func parsePositiveInt(input string) (int, error) {
 		return 0, fmt.Errorf("invalid")
 	}
 	return value, nil
+}
+
+func buildFeatureCollection(deviceID string, lineGeoJSON *string, points []models.TrackPointView) (featureCollection, error) {
+	features := make([]feature, 0, len(points)+1)
+
+	if lineGeoJSON != nil {
+		features = append(features, feature{
+			Type: "Feature",
+			Properties: map[string]interface{}{
+				"kind":      "path",
+				"device_id": deviceID,
+			},
+			Geometry: json.RawMessage(*lineGeoJSON),
+		})
+	}
+
+	for _, point := range points {
+		geom, err := marshalGeometry("Point", []interface{}{point.Longitude, point.Latitude})
+		if err != nil {
+			return featureCollection{}, err
+		}
+		features = append(features, feature{
+			Type: "Feature",
+			Properties: map[string]interface{}{
+				"kind":      "point",
+				"device_id": deviceID,
+				"time":      point.CreatedAt.UTC().Format(time.RFC3339),
+			},
+			Geometry: geom,
+		})
+	}
+
+	return featureCollection{
+		Type:     "FeatureCollection",
+		Features: features,
+	}, nil
+}
+
+func marshalGeometry(geomType string, coordinates interface{}) (json.RawMessage, error) {
+	payload := map[string]interface{}{
+		"type":        geomType,
+		"coordinates": coordinates,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(raw), nil
 }

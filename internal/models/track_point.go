@@ -15,3 +15,10 @@ type TrackPoint struct {
 func (TrackPoint) TableName() string {
 	return "track_points"
 }
+
+// TrackPointView is a lightweight projection for queries.
+type TrackPointView struct {
+	Latitude  float64
+	Longitude float64
+	CreatedAt time.Time
+}

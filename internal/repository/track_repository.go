@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"ha-trajectory/internal/models"
+
 	"gorm.io/gorm"
 )
 
@@ -64,4 +66,34 @@ func (r *TrackRepository) GetPathGeoJSONAll(ctx context.Context, deviceID string
 	}
 
 	return &geojson.String, nil
+}
+
+func (r *TrackRepository) GetPoints(ctx context.Context, deviceID string, start, end time.Time) ([]models.TrackPointView, error) {
+	var rows []models.TrackPointView
+	err := r.db.WithContext(ctx).Raw(
+		`SELECT latitude, longitude, created_at
+		 FROM track_points
+		 WHERE device_id = ? AND created_at >= ? AND created_at < ?
+		 ORDER BY created_at`,
+		deviceID, start, end,
+	).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (r *TrackRepository) GetPointsAll(ctx context.Context, deviceID string) ([]models.TrackPointView, error) {
+	var rows []models.TrackPointView
+	err := r.db.WithContext(ctx).Raw(
+		`SELECT latitude, longitude, created_at
+		 FROM track_points
+		 WHERE device_id = ?
+		 ORDER BY created_at`,
+		deviceID,
+	).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
